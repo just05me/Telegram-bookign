@@ -1,0 +1,164 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String   @id @default(uuid())
+  telegramId      BigInt   @unique
+  telegramUsername String?
+  firstName       String
+  lastName        String?
+  languageCode    String?
+  role            String   @default("CLIENT") // ORGANIZER | CLIENT
+  createdAt       DateTime @default(now())
+
+  organizer    Organizer?
+  appointments Appointment[]
+
+  @@map("users")
+}
+
+model Organizer {
+  id                  String   @id @default(uuid())
+  userId              String   @unique
+  slug                String   @unique
+  title               String
+  description         String?
+  defaultDuration     Int      @default(30)
+  bufferBefore        Int      @default(0)
+  bufferAfter         Int      @default(5)
+  maxMeetingsPerDay   Int      @default(10)
+  bookingDeadlineDays Int      @default(60)
+  timezone            String   @default("UTC")
+  isActive            Boolean  @default(true)
+  googleRefreshToken  String?
+  googleCalendarId    String?
+  createdAt           DateTime @default(now())
+
+  user               User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  availabilitySlots  AvailabilitySlot[]
+  exceptionDates    ExceptionDate[]
+  appointments      Appointment[]
+  bookingOptionGroups BookingOptionGroup[]
+
+  @@map("organizers")
+}
+
+model AvailabilitySlot {
+  id          String @id @default(uuid())
+  organizerId String
+  dayOfWeek   Int    // 0=Sunday, 1=Monday, ..., 6=Saturday
+  startTime   String // HH:mm in 24h format, organizer's timezone
+  endTime     String // HH:mm in 24h format
+
+  organizer Organizer @relation(fields: [organizerId], references: [id], onDelete: Cascade)
+
+  @@unique([organizerId, dayOfWeek, startTime, endTime])
+  @@map("availability_slots")
+}
+
+model ExceptionDate {
+  id          String  @id @default(uuid())
+  organizerId String
+  date        DateTime
+  isAvailable Boolean
+  startTime   String? // HH:mm, only if isAvailable=true and time differs from regular
+  endTime     String? // HH:mm
+  reason      String?
+
+  organizer Organizer @relation(fields: [organizerId], references: [id], onDelete: Cascade)
+
+  @@unique([organizerId, date])
+  @@map("exception_dates")
+}
+
+model Appointment {
+  id                     String   @id @default(uuid())
+  organizerId            String
+  clientId               String?
+  clientName             String
+  clientContact          String
+  clientNote             String?
+  instagram              String?
+  clientTelegram         String?
+  phoneNumber            String?
+  participantsCount      Int      @default(1)
+  selectedChoiceId       String?
+  startTime              DateTime
+  endTime                DateTime
+  duration               Int
+  status                 String   @default("CONFIRMED")
+  // status: CONFIRMED | CANCELLATION_REQUESTED | CANCELLED | RESCHEDULE_REQUESTED | RESCHEDULED
+  cancellationRequestedBy String?
+  // ORGANIZER | CLIENT
+  cancellationReason     String?
+  rescheduleTargetTime   DateTime?
+  location               String?
+  organizerNote          String?
+  googleEventId          String?
+  createdAt              DateTime @default(now())
+
+  organizer       Organizer           @relation(fields: [organizerId], references: [id], onDelete: Cascade)
+  client          User?               @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  reminders       Reminder[]
+  selectedChoice  BookingOptionChoice? @relation(fields: [selectedChoiceId], references: [id], onDelete: SetNull)
+
+  @@index([organizerId, startTime])
+  @@index([organizerId, status])
+  @@index([startTime])
+  @@map("appointments")
+}
+
+model BookingOptionGroup {
+  id          String   @id @default(uuid())
+  organizerId String
+  title       String
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  organizer Organizer             @relation(fields: [organizerId], references: [id], onDelete: Cascade)
+  choices   BookingOptionChoice[]
+
+  @@map("booking_option_groups")
+}
+
+model BookingOptionChoice {
+  id        String @id @default(uuid())
+  groupId   String
+  label     String
+  sortOrder Int    @default(0)
+
+  group       BookingOptionGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  appointments Appointment[]
+
+  @@map("booking_option_choices")
+}
+
+model Session {
+  telegramId Int      @id
+  type       String
+  data       String   // JSON serialized session data
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @default(now()) @updatedAt
+
+  @@map("sessions")
+}
+
+model Reminder {
+  id            String   @id @default(uuid())
+  appointmentId String
+  type          String   // BEFORE_1H | BEFORE_3H | BEFORE_1D
+  scheduledFor  DateTime
+  sentAt        DateTime?
+  status        String   @default("PENDING") // PENDING | SENT | FAILED
+
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+
+  @@index([status, scheduledFor])
+  @@map("reminders")
+}
