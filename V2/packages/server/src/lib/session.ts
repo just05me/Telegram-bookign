@@ -54,6 +54,14 @@ interface NoteSession {
   organizerId: string;
 }
 
+interface RescheduleSession {
+  appointmentId: string;
+  organizerId: string;
+  date: string | null; // YYYY-MM-DD
+  time: string | null; // HH:mm
+  step: 'date' | 'time';
+}
+
 type SessionEntry = {
   type: 'booking';
   data: BookingSession;
@@ -72,6 +80,9 @@ type SessionEntry = {
 } | {
   type: 'note';
   data: NoteSession;
+} | {
+  type: 'reschedule';
+  data: RescheduleSession;
 };
 
 class SessionStore {
@@ -83,7 +94,7 @@ class SessionStore {
     for (const row of rows) {
       try {
         const parsed = JSON.parse(row.data) as { type: string; data: unknown };
-        this.cache.set(row.telegramId, parsed as SessionEntry);
+        this.cache.set(Number(row.telegramId), parsed as SessionEntry);
       } catch {
         // Skip corrupted rows
       }
@@ -94,11 +105,11 @@ class SessionStore {
   private async persist(telegramId: number, entry: SessionEntry | null): Promise<void> {
     try {
       if (entry === null) {
-        await prisma.session.delete({ where: { telegramId } }).catch(() => {});
+        await prisma.session.delete({ where: { telegramId: BigInt(telegramId) } }).catch(() => {});
       } else {
         await prisma.session.upsert({
-          where: { telegramId },
-          create: { telegramId, type: entry.type, data: JSON.stringify(entry) },
+          where: { telegramId: BigInt(telegramId) },
+          create: { telegramId: BigInt(telegramId), type: entry.type, data: JSON.stringify(entry) },
           update: { type: entry.type, data: JSON.stringify(entry) },
         });
       }
@@ -217,6 +228,17 @@ class SessionStore {
   save(telegramId: number): void {
     const entry = this.cache.get(telegramId);
     if (entry) this.persist(telegramId, entry);
+  }
+
+  getReschedule(telegramId: number): RescheduleSession | undefined {
+    const entry = this.cache.get(telegramId);
+    if (entry?.type !== 'reschedule') return undefined;
+    return this.autoPersist(telegramId, entry, entry.data);
+  }
+
+  setReschedule(telegramId: number, data: RescheduleSession): void {
+    this.cache.set(telegramId, { type: 'reschedule', data });
+    this.persist(telegramId, { type: 'reschedule', data });
   }
 }
 

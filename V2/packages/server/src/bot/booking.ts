@@ -4,7 +4,6 @@ import { generateAvailableSlots } from '../lib/slots';
 import { sessionStore, type BookingSession } from '../lib/session';
 import { sendTelegramMessage } from '../lib/telegram';
 import { escMarkdown } from '../lib/escape';
-import { createCalendarEvent } from '../lib/google';
 
 // ─── Calendar keyboard ─────────────────────────────────────────────
 
@@ -732,27 +731,6 @@ export async function handleBookingConfirm(ctx: Context) {
       orgMsg,
       appointmentActionsKeyboard(appointment.id)
     );
-
-    // Create Google Calendar event if organizer has connected calendar
-    if (organizer.googleRefreshToken && organizer.user) {
-      try {
-        const event = await createCalendarEvent({
-          refreshToken: organizer.googleRefreshToken,
-          summary: `Встреча: ${session.formData.name} — ${organizer.title}`,
-          description: `Клиент: ${session.formData.name}\nТелефон: ${session.formData.phoneNumber || '—'}\nTelegram: ${session.formData.clientTelegram || '—'}\nЗаметка: ${session.formData.note || '—'}`,
-          startTime,
-          endTime,
-        });
-        if (event.id) {
-          await prisma.appointment.update({
-            where: { id: appointment.id },
-            data: { googleEventId: event.id },
-          });
-        }
-      } catch (err) {
-        console.error('Failed to create Google Calendar event:', err);
-      }
-    }
 
     sessionStore.delete(tgId);
   } catch (err) {

@@ -140,7 +140,7 @@ model BookingOptionChoice {
 }
 
 model Session {
-  telegramId Int      @id
+  telegramId BigInt   @id
   type       String
   data       String   // JSON serialized session data
   createdAt  DateTime @default(now())

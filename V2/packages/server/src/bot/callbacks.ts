@@ -1,11 +1,9 @@
-import { Bot, Context } from 'grammy';
-import { InlineKeyboard } from 'grammy';
+import { Bot, Context, InlineKeyboard } from 'grammy';
 import { prisma } from '../lib/prisma';
 import { mainMenuKeyboard, startKeyboard, confirmCancelKeyboard, confirmRescheduleKeyboard, appointmentActionsKeyboard, bookingLinkKeyboard, appointmentDetailKeyboard, clientMenuKeyboard } from './keyboards';
 import { sendAppointmentNotification } from '../lib/telegram';
 import { escMarkdown } from '../lib/escape';
-import { deleteCalendarEvent } from '../lib/google';
-import { showSettings, handleSettingsEdit, handleSettingsText, handleGoogleConnect } from './settings';
+import { showSettings, handleSettingsEdit, handleSettingsText } from './settings';
 import { showAvailability, handleAvailabilityCallback, handleAvailabilityText } from './availability';
 import { showOptionsList, handleOptionsCallback, handleOptionsText, handleOptionsAddAnother } from './options';
 import { handleAddressCallback } from './address';
@@ -19,8 +17,10 @@ import {
   handleBookingConfirm,
   handleBookingCancel,
   handleBackToDate,
+  buildCalendarKeyboard,
 } from './booking';
 import { sessionStore } from '../lib/session';
+import { generateAvailableSlots } from '../lib/slots';
 
 export function registerCallbacks(bot: Bot) {
   // Main menu navigation
@@ -43,6 +43,10 @@ export function registerCallbacks(bot: Bot) {
   bot.callbackQuery(/reject_reschedule:(.+)/, rejectRescheduleHandler);
   bot.callbackQuery(/reschedule_appointment:(.+)/, rescheduleAppointmentHandler);
 
+  // Reschedule flow (before generic cal: to match first)
+  bot.callbackQuery(/^cal:rs:/, handleRescheduleCalendar);
+  bot.callbackQuery(/^rs_slot:/, handleRescheduleTimeSelect);
+
   // Appointment detail view
   bot.callbackQuery(/^appt_detail:(.+)/, appointmentDetailHandler);
   bot.callbackQuery(/^edit_note:(.+)/, editNoteHandler);
@@ -61,9 +65,6 @@ export function registerCallbacks(bot: Bot) {
 
   // Settings flow
   bot.callbackQuery(/^set:edit:/, handleSettingsEdit);
-
-  // Google Calendar connect
-  bot.callbackQuery(/^google:connect$/, handleGoogleConnect);
 
   // Availability flow
   bot.callbackQuery(/^avail:/, handleAvailabilityCallback);
@@ -450,15 +451,6 @@ async function confirmCancelHandler(ctx: Context) {
     data: { status: 'CANCELLED' },
   });
 
-  // Delete Google Calendar event if it exists
-  if (appointment.googleEventId && appointment.organizer?.googleRefreshToken) {
-    try {
-      await deleteCalendarEvent(appointment.organizer.googleRefreshToken, appointment.googleEventId);
-    } catch (err) {
-      console.error('Failed to delete Google Calendar event:', err);
-    }
-  }
-
   await ctx.reply('✅ Встреча отменена.');
 
   // Notify the other party that cancellation was confirmed
@@ -624,8 +616,273 @@ async function rejectRescheduleHandler(ctx: Context) {
 
 async function rescheduleAppointmentHandler(ctx: Context) {
   if (!ctx.callbackQuery) return;
+  const match = ctx.callbackQuery.data?.match(/reschedule_appointment:(.+)/);
+  if (!match) return;
   await ctx.answerCallbackQuery();
-  await ctx.reply('🔄 Функция переноса будет доступна в ближайшее время.');
+
+  const appointmentId = match[1];
+  const tgId = ctx.from?.id;
+  if (!tgId) return;
+
+  const appointment = await prisma.appointment.findUnique({
+    where: { id: appointmentId },
+    include: { organizer: { include: { user: true, availabilitySlots: true } }, client: true },
+  });
+
+  if (!appointment) {
+    await ctx.reply('❌ Встреча не найдена.');
+    return;
+  }
+
+  if (appointment.status !== 'CONFIRMED') {
+    await ctx.reply('❌ Перенести можно только подтверждённую встречу.');
+    return;
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { telegramId: BigInt(tgId) },
+    include: { organizer: true },
+  });
+  if (!user) {
+    await ctx.reply('Пожалуйста, начните с команды /start');
+    return;
+  }
+
+  const isOrganizer = user.organizer?.id === appointment.organizerId;
+  const isClient = appointment.clientId === user.id;
+
+  if (!isOrganizer && !isClient) {
+    await ctx.reply('❌ У вас нет доступа к этой встрече.');
+    return;
+  }
+
+  // Create reschedule session
+  sessionStore.setReschedule(tgId, {
+    appointmentId,
+    organizerId: appointment.organizer.id,
+    date: null,
+    time: null,
+    step: 'date',
+  });
+
+  // Show calendar for date selection
+  const minDate = new Date();
+  const maxDate = new Date(Date.now() + appointment.organizer.bookingDeadlineDays * 24 * 60 * 60 * 1000);
+  const now = new Date();
+  const slug = appointment.organizer.slug;
+
+  await ctx.deleteMessage().catch(() => {});
+
+  const kb = buildCalendarKeyboard(now.getFullYear(), now.getMonth(), minDate, maxDate, `rs:${appointmentId}`);
+
+  await ctx.reply(
+    `🔄 *Перенос встречи*\n\nВыберите *новую дату* для встречи с *${escMarkdown(appointment.clientName)}*:`,
+    { parse_mode: 'Markdown', reply_markup: kb }
+  );
+}
+
+async function handleRescheduleCalendar(ctx: Context) {
+  if (!ctx.callbackQuery?.data) return;
+  // Pattern: cal:rs:<appointmentId>:... or cal:rs:<appointmentId>:select:<date> or cal:rs:<appointmentId>:back
+  const parts = ctx.callbackQuery.data.split(':');
+  if (parts[0] !== 'cal' || parts[1] !== 'rs') return;
+  await ctx.answerCallbackQuery();
+
+  const appointmentId = parts[2];
+  const action = parts[3];
+
+  if (action === 'ignore') return;
+
+  const tgId = ctx.from?.id;
+  if (!tgId) return;
+
+  const rs = sessionStore.getReschedule(tgId);
+  if (!rs || rs.appointmentId !== appointmentId) {
+    await ctx.editMessageText('❌ Сессия переноса устарела. Начните заново.');
+    return;
+  }
+
+  const appointment = await prisma.appointment.findUnique({
+    where: { id: appointmentId },
+    include: { organizer: { include: { availabilitySlots: true } } },
+  });
+  if (!appointment) {
+    await ctx.editMessageText('❌ Встреча не найдена.');
+    return;
+  }
+
+  const minDate = new Date();
+  const maxDate = new Date(Date.now() + appointment.organizer.bookingDeadlineDays * 24 * 60 * 60 * 1000);
+
+  if (action === 'select') {
+    const dateStr = parts[4];
+    rs.date = dateStr;
+    rs.step = 'time';
+
+    // Show time slots
+    const organizerData = {
+      id: appointment.organizer.id,
+      slug: appointment.organizer.slug,
+      defaultDuration: appointment.organizer.defaultDuration,
+      bufferBefore: appointment.organizer.bufferBefore,
+      bufferAfter: appointment.organizer.bufferAfter,
+      maxMeetingsPerDay: appointment.organizer.maxMeetingsPerDay,
+      bookingDeadlineDays: appointment.organizer.bookingDeadlineDays,
+      timezone: appointment.organizer.timezone,
+      availabilitySlots: appointment.organizer.availabilitySlots,
+    };
+
+    const slots = await generateAvailableSlots(organizerData, dateStr, appointment.organizer.timezone);
+
+    if (slots.length === 0) {
+      const kb = new InlineKeyboard()
+        .text('← Другая дата', `cal:rs:${appointmentId}:back`)
+        .text('❌ Отменить', 'main_menu');
+      await ctx.editMessageText('❌ На эту дату нет свободных слотов. Выберите другую дату.', {
+        reply_markup: kb,
+      });
+      return;
+    }
+
+    const dateObj = new Date(dateStr + 'T00:00:00');
+    const formattedDate = dateObj.toLocaleDateString('ru-RU', {
+      day: 'numeric', month: 'long', year: 'numeric',
+    });
+
+    const kb = new InlineKeyboard();
+    for (let i = 0; i < slots.length; i += 3) {
+      const row = slots.slice(i, i + 3);
+      for (const slot of row) {
+        kb.text(slot.start, `rs_slot:${appointmentId}:${dateStr}:${slot.start}`);
+      }
+      kb.row();
+    }
+    kb.text('← Другая дата', `cal:rs:${appointmentId}:back`);
+    kb.text('❌ Отменить', 'main_menu');
+
+    await ctx.editMessageText(
+      `🔄 *Перенос встречи*\n\n📅 *${formattedDate}*\n\nВыберите *новое время*:`,
+      { parse_mode: 'Markdown', reply_markup: kb }
+    );
+    return;
+  }
+
+  if (action === 'back') {
+    const now = new Date();
+    const kb = buildCalendarKeyboard(now.getFullYear(), now.getMonth(), minDate, maxDate, `rs:${appointmentId}`);
+    rs.date = null;
+    rs.step = 'date';
+    await ctx.editMessageText(
+      `🔄 *Перенос встречи*\n\nВыберите *новую дату*:`,
+      { parse_mode: 'Markdown', reply_markup: kb }
+    );
+    return;
+  }
+
+  // Calendar navigation: cal:rs:<id>:<year>:<month>
+  const year = parseInt(parts[3]);
+  const month = parseInt(parts[4]);
+
+  const kb = buildCalendarKeyboard(year, month, minDate, maxDate, `rs:${appointmentId}`);
+  await ctx.editMessageReplyMarkup({ reply_markup: kb });
+}
+
+async function handleRescheduleTimeSelect(ctx: Context) {
+  if (!ctx.callbackQuery?.data) return;
+  const parts = ctx.callbackQuery.data.split(':');
+  if (parts[0] !== 'rs_slot') return;
+  await ctx.answerCallbackQuery();
+
+  const appointmentId = parts[1];
+  const dateStr = parts[2];
+  const time = parts.slice(3).join(':');
+
+  const tgId = ctx.from?.id;
+  if (!tgId) return;
+
+  const rs = sessionStore.getReschedule(tgId);
+  if (!rs || rs.appointmentId !== appointmentId) {
+    await ctx.reply('❌ Сессия переноса устарела. Начните заново.');
+    return;
+  }
+
+  const appointment = await prisma.appointment.findUnique({
+    where: { id: appointmentId },
+    include: { organizer: { include: { user: true } }, client: true },
+  });
+
+  if (!appointment) {
+    await ctx.reply('❌ Встреча не найдена.');
+    sessionStore.delete(tgId);
+    return;
+  }
+
+  const newStartTime = new Date(dateStr + `T${time}:00Z`);
+
+  // Check for conflicts
+  const duration = appointment.duration;
+  const newEndTime = new Date(newStartTime.getTime() + duration * 60000);
+
+  const conflicting = await prisma.appointment.findFirst({
+    where: {
+      organizerId: appointment.organizerId,
+      id: { not: appointmentId },
+      status: { in: ['CONFIRMED', 'RESCHEDULE_REQUESTED'] },
+      startTime: { lt: newEndTime },
+      endTime: { gt: newStartTime },
+    },
+  });
+
+  if (conflicting) {
+    await ctx.reply('❌ Это время уже занято. Выберите другое.', {
+      reply_markup: new InlineKeyboard()
+        .text('← Другая дата', `cal:rs:${appointmentId}:back`),
+    });
+    return;
+  }
+
+  // Save reschedule target and update status
+  await prisma.appointment.update({
+    where: { id: appointmentId },
+    data: {
+      rescheduleTargetTime: newStartTime,
+      status: 'RESCHEDULE_REQUESTED',
+    },
+  });
+
+  sessionStore.delete(tgId);
+
+  const dateStrRu = newStartTime.toLocaleDateString('ru-RU');
+  const timeStrRu = newStartTime.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+
+  await ctx.editMessageText(
+    `⏳ *Запрос на перенос отправлен*\n\nНовое время: *${dateStrRu}* в *${timeStrRu}*\n\nОжидайте подтверждения другой стороны.`,
+    { parse_mode: 'Markdown' }
+  );
+
+  // Notify the other party
+  const user = await prisma.user.findUnique({
+    where: { telegramId: BigInt(tgId) },
+    include: { organizer: true },
+  });
+  const isOrganizer = !!(user?.organizer && appointment.organizerId === user.organizer.id);
+
+  if (isOrganizer && appointment.client?.telegramId) {
+    await sendAppointmentNotification(
+      appointment.organizer.user,
+      Number(appointment.client.telegramId),
+      `🔄 *Запрос на перенос встречи*\n\n` +
+        `*${escMarkdown(appointment.clientName)}*, организатор предлагает перенести встречу на *${dateStrRu}* в *${timeStrRu}*.\n\nПодтвердите или отклоните:`,
+      confirmRescheduleKeyboard(appointmentId)
+    );
+  } else if (!isOrganizer && appointment.organizer.user?.telegramId) {
+    await sendAppointmentNotification(
+      appointment.organizer.user,
+      Number(appointment.organizer.user.telegramId),
+      `🔄 *Запрос на перенос встречи*\n\nКлиент *${escMarkdown(appointment.clientName)}* хочет перенести встречу на *${dateStrRu}* в *${timeStrRu}*.\n\nПодтвердите или отклоните:`,
+      confirmRescheduleKeyboard(appointmentId)
+    );
+  }
 }
 
 // ─── Organizer note ──────────────────────────────────────────────

@@ -3,9 +3,6 @@ import { InlineKeyboard } from 'grammy';
 import { prisma } from '../lib/prisma';
 import { sessionStore } from '../lib/session';
 import { escMarkdown } from '../lib/escape';
-import crypto from 'crypto';
-import { config } from '../config';
-import { storePendingAuth } from '../api/google';
 
 const SETTINGS_FIELDS = [
   { key: 'title', label: 'Название', min: 1, max: 100 },
@@ -35,7 +32,6 @@ export async function showSettings(ctx: Context) {
   }
 
   const o = user.organizer;
-  const gcalConnected = !!o.googleRefreshToken;
   const kb = new InlineKeyboard()
     .text('✏️ Название', 'set:edit:title')
     .text('✏️ Описание', 'set:edit:description')
@@ -47,8 +43,6 @@ export async function showSettings(ctx: Context) {
     .row()
     .text(`📊 Макс/день: ${o.maxMeetingsPerDay}`, `set:edit:maxMeetingsPerDay`)
     .text(`📅 Дней: ${o.bookingDeadlineDays}`, `set:edit:bookingDeadlineDays`)
-    .row()
-    .text(gcalConnected ? '✅ Google Calendar' : '🔗 Подключить Google Calendar', 'google:connect')
     .row()
     .text('🏠 Меню', 'main_menu')
     .text('◀️ Назад', 'main_menu');
@@ -62,7 +56,6 @@ export async function showSettings(ctx: Context) {
       `Буфер после: ${o.bufferAfter} мин\n` +
       `Макс. встреч в день: ${o.maxMeetingsPerDay}\n` +
       `Дней для брони: ${o.bookingDeadlineDays}\n` +
-      `Google Calendar: ${gcalConnected ? '✅ Подключён' : '❌ Не подключён'}\n\n` +
       `Нажмите на параметр, чтобы изменить:`,
     { parse_mode: 'Markdown', reply_markup: kb }
   );
@@ -157,38 +150,3 @@ export async function handleSettingsText(ctx: Context) {
   }
 }
 
-export async function handleGoogleConnect(ctx: Context) {
-  if (!ctx.callbackQuery) return;
-  await ctx.answerCallbackQuery();
-
-  const tgId = ctx.from?.id;
-  if (!tgId) return;
-
-  const user = await prisma.user.findUnique({
-    where: { telegramId: BigInt(tgId) },
-    include: { organizer: true },
-  });
-
-  if (!user?.organizer) {
-    await ctx.reply('Сначала создайте календарь.');
-    return;
-  }
-
-  if (user.organizer.googleRefreshToken) {
-    await ctx.reply('✅ Google Calendar уже подключён. Встречи будут синхронизироваться автоматически.');
-    return;
-  }
-
-  const state = crypto.randomBytes(16).toString('hex');
-  storePendingAuth(state, { telegramId: tgId });
-
-  const host = config.google.redirectUri.replace('/api/google/callback', '');
-  const authUrl = `${host}/api/google/auth?state=${state}`;
-
-  await ctx.reply(
-    `🔗 *Подключение Google Calendar*\n\n` +
-      `Нажмите на ссылку ниже, чтобы авторизоваться:\n${authUrl}\n\n` +
-      `После подтверждения вернитесь в бота.\n\n_Ссылка действительна 10 минут._`,
-    { parse_mode: 'Markdown' }
-  );
-}

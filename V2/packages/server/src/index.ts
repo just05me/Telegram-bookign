@@ -1,6 +1,5 @@
 import express from 'express';
 import { config } from './config';
-import { googleRouter } from './api/google';
 import { startBot } from './bot';
 import { startReminderCron } from './lib/reminders';
 import { sessionStore } from './lib/session';
@@ -8,9 +7,6 @@ import { sessionStore } from './lib/session';
 const app = express();
 
 app.use(express.json());
-
-// Google OAuth endpoints (need HTTP for OAuth callback)
-app.use('/api/google', googleRouter);
 
 // Health check
 app.get('/health', (_req, res) => {
@@ -27,14 +23,10 @@ async function main() {
   // Start reminder cron
   startReminderCron();
 
-  // Only start Express if Google OAuth is configured
-  if (config.google.clientId && config.google.clientSecret) {
-    app.listen(config.port, () => {
-      console.log(`Server running on port ${config.port} (Google OAuth)`);
-    });
-  } else {
-    console.log('Google OAuth not configured — HTTP server not started.');
-  }
+  // Start HTTP server
+  app.listen(config.port, () => {
+    console.log(`Server running on port ${config.port}`);
+  });
 }
 
 main().catch((err) => {

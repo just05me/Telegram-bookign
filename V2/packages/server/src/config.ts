@@ -36,18 +36,4 @@ export const config = {
     token: process.env['BOT_TOKEN'] || '',
     webhookUrl: process.env['BOT_WEBHOOK_URL'] || '',
   },
-
-  google: {
-    clientId: process.env['GOOGLE_CLIENT_ID'] || '',
-    clientSecret: process.env['GOOGLE_CLIENT_SECRET'] || '',
-    redirectUri:
-      process.env['GOOGLE_REDIRECT_URI'] ||
-      'http://localhost:3001/api/google/callback',
-    scopes: [
-      'https://www.googleapis.com/auth/calendar',
-      'https://www.googleapis.com/auth/calendar.events',
-    ],
-  },
-
-  encryptionKey: process.env['ENCRYPTION_KEY'] || 'dev-encryption-key-32chars!!',
 };

@@ -3,9 +3,9 @@ import { prisma } from './prisma';
 import { sendTelegramMessage } from './telegram';
 
 const REMINDER_INTERVALS: Record<string, { label: string; ms: number }> = {
-  BEFORE_1D: { label: 'за 1 день', ms: 24 * 60 * 60 * 1000 },
+  BEFORE_3D: { label: 'за 72 часа', ms: 72 * 60 * 60 * 1000 },
+  BEFORE_1D: { label: 'за 24 часа', ms: 24 * 60 * 60 * 1000 },
   BEFORE_3H: { label: 'за 3 часа', ms: 3 * 60 * 60 * 1000 },
-  BEFORE_1H: { label: 'за 1 час', ms: 60 * 60 * 1000 },
 };
 
 export function startReminderCron() {
